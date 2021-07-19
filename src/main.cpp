@@ -60,7 +60,61 @@ const uint8_t* get_peer_mac_address()
 
 void esp_now_recv_callback(const uint8_t *mac_addr, const uint8_t *data, int data_len)
 {
+    gpio_set_level(GPIO_NUM_2, 1);
     uart_write_bytes(UART_NUM_0, (const char*)data, data_len);
+    gpio_set_level(GPIO_NUM_2, 0);
+}
+
+typedef struct {
+	uint32_t frame_ctrl : 16;
+	uint32_t duration_id : 16;
+	uint8_t addr1[6]; /* receiver address */
+	uint8_t addr2[6]; /* sender address */
+	uint8_t addr3[6]; /* filtering address */
+	uint32_t sequence_ctrl : 16;
+	uint8_t addr4[6]; /* optional */
+} wifi_ieee80211_mac_hdr_t;
+
+typedef struct {
+	wifi_ieee80211_mac_hdr_t hdr;
+	uint8_t payload[0]; /* network data ended with 4 bytes csum (CRC32) */
+} wifi_ieee80211_packet_t;
+
+void promiscuous_rx_callback(void* buffer, wifi_promiscuous_pkt_type_t pkt_type)
+{
+    static int last_rssi = -1;
+    // All espnow traffic uses action frames which are a subtype of the mgmnt frames so filter out everything else.
+    if (pkt_type != WIFI_PKT_MGMT) {
+        return;
+    }
+    static const uint8_t ACTION_SUBTYPE = 0xD0;
+    static const uint8_t ESPRESSIF_OUI[] = {0x7C, 0X9E, 0XBD};
+
+
+    const wifi_promiscuous_pkt_t* ppkt = (wifi_promiscuous_pkt_t*)buffer;
+    const wifi_ieee80211_packet_t* ipkt = (wifi_ieee80211_packet_t*)ppkt->payload;
+    const wifi_ieee80211_mac_hdr_t* hdr = &ipkt->hdr;
+
+    /*
+    addr1: 7c:9e:bd:39:9f:68
+    addr2: 7c:9e:bd:ed:36:94
+    addr3: ff:ff:ff:ff:ff:ff
+    
+    printf("addr1: %x:%x:%x:%x:%x:%x\r\n", hdr->addr1[0], hdr->addr1[1], hdr->addr1[2], hdr->addr1[3], hdr->addr1[4], hdr->addr1[5]);
+    printf("addr2: %x:%x:%x:%x:%x:%x\r\n", hdr->addr2[0], hdr->addr2[1], hdr->addr2[2], hdr->addr2[3], hdr->addr2[4], hdr->addr2[5]);
+    printf("addr3: %x:%x:%x:%x:%x:%x\r\n", hdr->addr3[0], hdr->addr3[1], hdr->addr3[2], hdr->addr3[3], hdr->addr3[4], hdr->addr3[5]);
+    */
+    // Only continue processing if this is an action frame containing the Espressif OUI.
+    if ((ACTION_SUBTYPE == (hdr->frame_ctrl & 0xFF)) &&
+        (memcmp(hdr->addr2, ESPRESSIF_OUI, 3) == 0)) {
+         int rssi = ppkt->rx_ctrl.rssi;
+         if (rssi != last_rssi) {
+             last_rssi = rssi;
+             char rssi_msg[32] = {0};
+             sprintf(rssi_msg, "RSSI: %d\r\n", last_rssi);
+             uart_write_bytes(UART_NUM_0, rssi_msg, strlen(rssi_msg));
+         }
+     }
 }
 
 void app_main(void) 
@@ -78,12 +132,16 @@ void app_main(void)
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0, GPIO_NUM_1, GPIO_NUM_3, GPIO_NUM_22, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0));
+    // Configure the onboard LED
+    gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
     // configure ESP NOW
     ESP_ERROR_CHECK(nvs_flash_init());
     const wifi_init_config_t wifi_config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_config));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(&promiscuous_rx_callback));
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(&esp_now_recv_callback));
@@ -103,7 +161,6 @@ void app_main(void)
     while (1)
     {
         ESP_ERROR_CHECK(esp_now_send(peer_mac, (const uint8_t*)"Hello World!\r\n", strlen("Hello World!\r\n")));
-        //uart_write_bytes(UART_NUM_0, "Hello World!\n", 13);
-        vTaskDelay(1000/ portTICK_PERIOD_MS);
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 }
