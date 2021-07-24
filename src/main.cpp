@@ -16,6 +16,35 @@ extern "C" {
     void app_main(void);
 }
 
+enum SendStatus{
+    Idle,
+    Busy,
+    Success,
+    Fail,
+};
+
+struct Statistics {
+    uint64_t bytesSent;
+    uint64_t sentBps;
+    uint64_t bytesReceived;
+    uint64_t receivedBps;
+    uint32_t successes;
+    uint32_t failures;
+    int32_t lastRssi;
+    SendStatus lastStatus;
+};
+
+Statistics stats = {
+    .bytesSent = 0,
+    .sentBps = 0,
+    .bytesReceived = 0,
+    .receivedBps = 0,
+    .successes = 0,
+    .failures = 0,
+    .lastRssi = -999,
+    .lastStatus = SendStatus::Idle,
+};
+
 // Left  = MAC Address: 7c:9e:bd:ed:36:94
 // Right = MAC Address: 7c:9e:bd:39:9f:68
 const uint8_t MAC_ADDR_LIST[2][6] = {
@@ -30,27 +59,27 @@ void mac_to_str(const uint8_t* mac, char* buffer)
 
 void print_mac(const uint8_t* mac, const char* msg, bool newline=true)
 {
-    char mac_str[20] = {0};
+    char macStr[20] = {0};
     char buffer[128] = {0};
-    mac_to_str(mac, mac_str);
+    mac_to_str(mac, macStr);
     std::string end = "\r\n";
     if (!newline) {
         end = "\0";
     }
-    sprintf(buffer, "%s: %s%s", msg, mac_str, end.c_str());
+    sprintf(buffer, "%s: %s%s", msg, macStr, end.c_str());
     uart_write_bytes(UART_NUM_0, buffer, strlen(buffer));
 }
 
 const uint8_t* get_peer_mac_address()
 {
     // Grab our MAC address
-    uint8_t mac_buffer[6] = {0};
-    ESP_ERROR_CHECK(esp_efuse_mac_get_default(mac_buffer));
-    print_mac(mac_buffer, "MAC ADDRESS");
+    uint8_t macBuffer[6] = {0};
+    ESP_ERROR_CHECK(esp_efuse_mac_get_default(macBuffer));
+    print_mac(macBuffer, "MAC ADDRESS");
     // Grab the first MAC address that doesn't match ours
     for (int i=0; i < sizeof MAC_ADDR_LIST / 6; ++i) {
         for (int x=0; x < 6; ++x) {
-            if (MAC_ADDR_LIST[i][x] != mac_buffer[x]) {
+            if (MAC_ADDR_LIST[i][x] != macBuffer[x]) {
                 return MAC_ADDR_LIST[i];
             }
         }
@@ -61,8 +90,18 @@ const uint8_t* get_peer_mac_address()
 void esp_now_recv_callback(const uint8_t *mac_addr, const uint8_t *data, int data_len)
 {
     gpio_set_level(GPIO_NUM_2, 1);
-    uart_write_bytes(UART_NUM_0, (const char*)data, data_len);
+    //uart_write_bytes(UART_NUM_0, (const char*)data, data_len);
+    vTaskDelay(1);
     gpio_set_level(GPIO_NUM_2, 0);
+}
+
+void esp_now_send_callback(const uint8_t *mac_addr, esp_now_send_status_t status)
+{
+    if (status == ESP_NOW_SEND_SUCCESS) {
+        stats.lastStatus = SendStatus::Success;
+    } else {
+        stats.lastStatus = SendStatus::Fail;
+    }
 }
 
 typedef struct {
@@ -82,7 +121,9 @@ typedef struct {
 
 void promiscuous_rx_callback(void* buffer, wifi_promiscuous_pkt_type_t pkt_type)
 {
-    static int last_rssi = -1;
+    const int MAX_RSSI_COUNT = 20;
+    static int rssiValues[MAX_RSSI_COUNT] = {};
+    static int lastRssiIndex = 0;
     // All espnow traffic uses action frames which are a subtype of the mgmnt frames so filter out everything else.
     if (pkt_type != WIFI_PKT_MGMT) {
         return;
@@ -95,32 +136,87 @@ void promiscuous_rx_callback(void* buffer, wifi_promiscuous_pkt_type_t pkt_type)
     const wifi_ieee80211_packet_t* ipkt = (wifi_ieee80211_packet_t*)ppkt->payload;
     const wifi_ieee80211_mac_hdr_t* hdr = &ipkt->hdr;
 
-    /*
-    addr1: 7c:9e:bd:39:9f:68
-    addr2: 7c:9e:bd:ed:36:94
-    addr3: ff:ff:ff:ff:ff:ff
-    
-    printf("addr1: %x:%x:%x:%x:%x:%x\r\n", hdr->addr1[0], hdr->addr1[1], hdr->addr1[2], hdr->addr1[3], hdr->addr1[4], hdr->addr1[5]);
-    printf("addr2: %x:%x:%x:%x:%x:%x\r\n", hdr->addr2[0], hdr->addr2[1], hdr->addr2[2], hdr->addr2[3], hdr->addr2[4], hdr->addr2[5]);
-    printf("addr3: %x:%x:%x:%x:%x:%x\r\n", hdr->addr3[0], hdr->addr3[1], hdr->addr3[2], hdr->addr3[3], hdr->addr3[4], hdr->addr3[5]);
-    */
     // Only continue processing if this is an action frame containing the Espressif OUI.
     if ((ACTION_SUBTYPE == (hdr->frame_ctrl & 0xFF)) &&
         (memcmp(hdr->addr2, ESPRESSIF_OUI, 3) == 0)) {
-         int rssi = ppkt->rx_ctrl.rssi;
-         if (rssi != last_rssi) {
-             last_rssi = rssi;
-             char rssi_msg[32] = {0};
-             sprintf(rssi_msg, "RSSI: %d\r\n", last_rssi);
-             uart_write_bytes(UART_NUM_0, rssi_msg, strlen(rssi_msg));
-         }
-     }
+        int rssi = ppkt->rx_ctrl.rssi;
+        if (stats.lastRssi == -999) {
+            // We don't have any data yet so lets fill the entire array right now.
+            for (int i=0; i < MAX_RSSI_COUNT; ++i) {
+                rssiValues[i] = rssi;
+            }
+        } else {
+            // Add the RSSI Value to the array
+            rssiValues[lastRssiIndex++] = rssi;
+            // reset the index to the beginning if we hit the end
+            if (lastRssiIndex >= MAX_RSSI_COUNT) {
+                lastRssiIndex = 0;
+            }
+        }
+        // Calculate the average
+        stats.lastRssi = 0;
+        for (int i=0; i < MAX_RSSI_COUNT; ++i) {
+            stats.lastRssi += rssiValues[i];
+        }
+        stats.lastRssi /= MAX_RSSI_COUNT;
+    }
+}
+
+
+
+void displayStatsTask(void* pvParameters)
+{
+    auto last_ticks = xTaskGetTickCount();
+    auto start = xTaskGetTickCount();
+    while (true) {
+        // display information
+        if (pdTICKS_TO_MS((xTaskGetTickCount()-last_ticks)) >= 1000) {
+            auto elapsedMs = pdTICKS_TO_MS(xTaskGetTickCount()-start);
+            double KBPerSec = 0;
+            if (stats.bytesSent && elapsedMs) {
+                KBPerSec = stats.bytesSent / (elapsedMs/1000.0) / 1000.0;
+            }
+            printf("Bytes Sent: %lld (%.2fKB/sec) - %d Success / %d Fails (RSSI: %ddB)                               \r", 
+                stats.bytesSent, KBPerSec, stats.successes, stats.failures, stats.lastRssi);
+            // reset the calculation every 10 seconds
+            if (elapsedMs > 10000) {
+                start = xTaskGetTickCount();
+                stats.bytesSent = 0;
+            }
+            last_ticks = xTaskGetTickCount();
+        }
+    }
+    //vTaskDelete(NULL);
+}
+
+void transmitESPNOWTask(void* pvParameters)
+{
+    const char msg[] = "Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!Hello World!\r\n";
+    const uint8_t* peerMac = get_peer_mac_address();
+    while (true) {
+        if (stats.lastStatus != SendStatus::Busy) {
+            if (stats.lastStatus == SendStatus::Fail) {
+                stats.failures += 1;
+                //printf("Failed to send (%d)!\r\n", failures);
+                // The esp now stack runs in a high priority wifi task
+                // we need to give it time to clear the buffer or we get an ESP_ERR_ESPNOW_NO_MEM and abort call
+                // vTaskDelay(1 / portTICK_PERIOD_MS);
+            } else if (stats.lastStatus == SendStatus::Success) {
+                stats.successes += 1;
+                stats.bytesSent += sizeof msg;
+            }
+            stats.lastStatus = SendStatus::Busy;
+            ESP_ERROR_CHECK(esp_now_send(peerMac, (const uint8_t*)msg, strlen(msg)));
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+        }
+    }
+    //vTaskDelete(NULL);
 }
 
 void app_main(void) 
 {
     // configure the uart, default serial port
-    uart_config_t uart_config = {
+    uart_config_t uartConfig = {
         .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
@@ -129,15 +225,15 @@ void app_main(void)
         .rx_flow_ctrl_thresh = 122,
         .use_ref_tick = false,
     };
-    ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &uart_config));
+    ESP_ERROR_CHECK(uart_param_config(UART_NUM_0, &uartConfig));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_0, GPIO_NUM_1, GPIO_NUM_3, GPIO_NUM_22, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0));
     // Configure the onboard LED
     gpio_set_direction(GPIO_NUM_2, GPIO_MODE_OUTPUT);
     // configure ESP NOW
     ESP_ERROR_CHECK(nvs_flash_init());
-    const wifi_init_config_t wifi_config = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&wifi_config));
+    const wifi_init_config_t wifiConfig = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifiConfig));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
@@ -145,22 +241,33 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_recv_cb(&esp_now_recv_callback));
+    ESP_ERROR_CHECK(esp_now_register_send_cb(&esp_now_send_callback));
     // Pair the devices
-    const uint8_t* peer_mac = get_peer_mac_address();
-    const esp_now_peer_info_t peer_info = {
-        .peer_addr = { peer_mac[0], peer_mac[1], peer_mac[2], peer_mac[3], peer_mac[4],peer_mac[5] },
+    const uint8_t* peerMac = get_peer_mac_address();
+    const esp_now_peer_info_t peerInfo = {
+        .peer_addr = { peerMac[0], peerMac[1], peerMac[2], peerMac[3], peerMac[4],peerMac[5] },
         .lmk = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
         .channel = 1,
         .ifidx = ESP_IF_WIFI_STA,
-        .encrypt = false,
+        .encrypt = true,
         nullptr,
     };
-    print_mac(peer_mac, "PEER MAC");
-    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
-
+    print_mac(peerMac, "PEER MAC");
+    ESP_ERROR_CHECK(esp_now_add_peer(&peerInfo));
+    
+    TaskHandle_t txHandle, statsHandle;
+    auto success = xTaskCreate(transmitESPNOWTask, "ESPNOW TX", 10000, NULL, tskIDLE_PRIORITY, &txHandle);
+    if (success != pdPASS) {
+        printf("Failed to create task ESPNOW TX\r\n");
+        vTaskDelete(txHandle);
+    }
+     success = xTaskCreate(displayStatsTask, "stats", 10000, NULL, tskIDLE_PRIORITY, &statsHandle);
+    if (success != pdPASS) {
+        printf("Failed to create task stats\r\n");
+        vTaskDelete(statsHandle);
+    }
     while (1)
     {
-        ESP_ERROR_CHECK(esp_now_send(peer_mac, (const uint8_t*)"Hello World!\r\n", strlen("Hello World!\r\n")));
         vTaskDelay(1000 / portTICK_PERIOD_MS);
     }
 }
